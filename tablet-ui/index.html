@@ -1,0 +1,366 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>inkstone tablet</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    background: #1a1a1a;
+    overflow: hidden;
+    font-family: -apple-system, sans-serif;
+    color: #eee;
+    height: 100dvh;
+    display: flex;
+    flex-direction: column;
+  }
+
+  #toolbar {
+    display: flex;
+    gap: 12px;
+    align-items: center;
+    padding: 8px 16px;
+    background: #111;
+    flex-shrink: 0;
+    height: 48px;
+  }
+
+  #toolbar button {
+    background: #333;
+    border: none;
+    color: #eee;
+    padding: 6px 14px;
+    border-radius: 8px;
+    font-size: 14px;
+    cursor: pointer;
+    -webkit-user-select: none;
+  }
+  #toolbar button.active { background: #c84040; }
+
+  #status {
+    margin-left: auto;
+    font-size: 12px;
+    color: #888;
+  }
+
+  #canvas-wrap {
+    flex: 1;
+    position: relative;
+    overflow: hidden;
+  }
+
+  /* Page background (JPEG snapshot from laptop) */
+  #page-bg {
+    position: absolute;
+    inset: 0;
+    object-fit: contain;
+    width: 100%;
+    height: 100%;
+    pointer-events: none;
+    background: #fff;
+  }
+
+  /* Ink canvas – sits on top of the page background */
+  #ink-canvas {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    touch-action: none;   /* critical: lets PointerEvent fire for Pencil */
+    cursor: crosshair;
+  }
+
+  /* Colour swatches */
+  .swatch {
+    width: 24px;
+    height: 24px;
+    border-radius: 50%;
+    border: 2px solid transparent;
+    cursor: pointer;
+    flex-shrink: 0;
+  }
+  .swatch.selected { border-color: #fff; }
+</style>
+</head>
+<body>
+
+<div id="toolbar">
+  <button id="btn-draw" class="active" onclick="setMode('draw')">Draw</button>
+  <button id="btn-erase" onclick="setMode('erase')">Erase</button>
+
+  <div class="swatch selected" style="background:#e03030" data-color="#e03030" onclick="setColor(this)"></div>
+  <div class="swatch" style="background:#2060e0" data-color="#2060e0" onclick="setColor(this)"></div>
+  <div class="swatch" style="background:#20a050" data-color="#20a050" onclick="setColor(this)"></div>
+  <div class="swatch" style="background:#e08020" data-color="#e08020" onclick="setColor(this)"></div>
+  <div class="swatch" style="background:#111111" data-color="#111111" onclick="setColor(this)"></div>
+
+  <span id="status">connecting…</span>
+</div>
+
+<div id="canvas-wrap">
+  <img id="page-bg" alt="">
+  <canvas id="ink-canvas"></canvas>
+</div>
+
+<script>
+// ─────────────────────────────────────────────────────────────────────────────
+// Configuration
+// Replace HOST with the laptop's IP (or hostname) on your local network.
+// When connected via USB iproxy, use 127.0.0.1:9001
+// ─────────────────────────────────────────────────────────────────────────────
+const WS_URL = (() => {
+  // Auto-detect: connect back to the host that served this page.
+  const host = location.hostname || '127.0.0.1';
+  return `ws://${host}:9001`;
+})();
+
+const BATCH_INTERVAL_MS = 8;   // how often to flush the sample buffer
+
+// ─────────────────────────────────────────────────────────────────────────────
+// State
+// ─────────────────────────────────────────────────────────────────────────────
+let ws = null;
+let wsReady = false;
+let mode = 'draw';         // 'draw' | 'erase'
+let color = '#e03030';
+let strokeId = 0;
+let isDrawing = false;
+let sampleBuffer = [];     // StylusSample[] waiting to be flushed
+let batchTimer = null;
+let strokeStartTime = 0;
+
+// Local rendering
+const canvas = document.getElementById('ink-canvas');
+const ctx2d = canvas.getContext('2d');
+let lastPt = null;         // { x, y } for line-to drawing
+
+// ─────────────────────────────────────────────────────────────────────────────
+// WebSocket
+// ─────────────────────────────────────────────────────────────────────────────
+function connect() {
+  setStatus('connecting…');
+  ws = new WebSocket(WS_URL);
+  ws.binaryType = 'arraybuffer';
+
+  ws.onopen = () => {
+    wsReady = true;
+    setStatus('connected ✓');
+  };
+
+  ws.onclose = () => {
+    wsReady = false;
+    setStatus('disconnected – retrying…');
+    setTimeout(connect, 2000);
+  };
+
+  ws.onerror = () => {
+    setStatus('error');
+  };
+
+  ws.onmessage = (ev) => {
+    // All laptop→iPad messages are binary (postcard).
+    // For now just handle page snapshot (tag byte 0x00).
+    const buf = new Uint8Array(ev.data);
+    handleLaptopMessage(buf);
+  };
+}
+
+function send(bytes) {
+  if (ws && wsReady) ws.send(bytes);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Very small postcard encoder for our two message types.
+//
+// postcard wire format for enums:
+//   variant index (varint) + fields
+//
+// Our TabletMessage enum:
+//   0 = StrokeBatch  { stroke_id: u32, samples: Vec<StylusSample> }
+//   1 = StrokeEnd    { stroke_id: u32 }
+//   2 = Ping
+//
+// StylusSample: { x:f32, y:f32, pressure:f32, tilt:f32, t_ms:u32 }
+//
+// We write f32 as little-endian IEEE 754, u32 as little-endian uint.
+// postcard uses ULEB128 varints for lengths; small counts fit in 1 byte.
+// ─────────────────────────────────────────────────────────────────────────────
+
+function encodeStrokeBatch(strokeId, samples) {
+  // Estimate capacity: 1 (variant) + 4 (stroke_id) + 1 (len) + N*20
+  const buf = new ArrayBuffer(6 + samples.length * 20);
+  const view = new DataView(buf);
+  let off = 0;
+
+  view.setUint8(off++, 0);               // variant 0 = StrokeBatch
+  view.setUint32(off, strokeId, true); off += 4;
+  view.setUint8(off++, samples.length);  // varint length (< 128 for normal use)
+
+  for (const s of samples) {
+    view.setFloat32(off, s.x,        true); off += 4;
+    view.setFloat32(off, s.y,        true); off += 4;
+    view.setFloat32(off, s.pressure, true); off += 4;
+    view.setFloat32(off, s.tilt,     true); off += 4;
+    view.setUint32( off, s.t_ms,     true); off += 4;
+  }
+  return new Uint8Array(buf, 0, off);
+}
+
+function encodeStrokeEnd(strokeId) {
+  const buf = new ArrayBuffer(5);
+  const view = new DataView(buf);
+  view.setUint8(0, 1);                    // variant 1 = StrokeEnd
+  view.setUint32(1, strokeId, true);
+  return new Uint8Array(buf);
+}
+
+function encodePing() {
+  return new Uint8Array([2]);             // variant 2 = Ping
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Laptop message handling (minimal – expand in milestone 3)
+// ─────────────────────────────────────────────────────────────────────────────
+function handleLaptopMessage(buf) {
+  const tag = buf[0];
+  if (tag === 0) {
+    // PageSnapshot – display JPEG in page-bg
+    // Byte layout after tag: page_idx(4) width(4) height(4) jpeg(rest)
+    const jpeg = buf.slice(13);
+    const blob = new Blob([jpeg], { type: 'image/jpeg' });
+    const url = URL.createObjectURL(blob);
+    const img = document.getElementById('page-bg');
+    if (img.src) URL.revokeObjectURL(img.src);
+    img.src = url;
+  }
+  // tag 1 = AckChange, tag 2 = Pong – nothing to do yet
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Canvas resize
+// ─────────────────────────────────────────────────────────────────────────────
+function resizeCanvas() {
+  const wrap = document.getElementById('canvas-wrap');
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width  = wrap.clientWidth  * dpr;
+  canvas.height = wrap.clientHeight * dpr;
+  canvas.style.width  = wrap.clientWidth  + 'px';
+  canvas.style.height = wrap.clientHeight + 'px';
+  ctx2d.scale(dpr, dpr);
+}
+window.addEventListener('resize', resizeCanvas);
+resizeCanvas();
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Drawing
+// ─────────────────────────────────────────────────────────────────────────────
+canvas.addEventListener('pointerdown', (e) => {
+  if (e.pointerType === 'touch' && e.isPrimary === false) return;
+  e.preventDefault();
+  isDrawing = true;
+  strokeId++;
+  strokeStartTime = Date.now();
+  lastPt = { x: e.offsetX, y: e.offsetY };
+
+  ctx2d.beginPath();
+  ctx2d.moveTo(lastPt.x, lastPt.y);
+
+  startBatchTimer();
+  pushSample(e);
+});
+
+canvas.addEventListener('pointermove', (e) => {
+  if (!isDrawing) return;
+  e.preventDefault();
+
+  // Local ink rendering
+  const pt = { x: e.offsetX, y: e.offsetY };
+  const pressure = e.pressure || 0.5;
+
+  ctx2d.lineWidth   = mode === 'erase' ? 24 : 1.5 + pressure * 3;
+  ctx2d.strokeStyle = mode === 'erase' ? 'rgba(255,255,255,1)' : color;
+  ctx2d.lineCap     = 'round';
+  ctx2d.lineJoin    = 'round';
+  ctx2d.globalCompositeOperation = mode === 'erase'
+    ? 'destination-out'
+    : 'source-over';
+
+  ctx2d.lineTo(pt.x, pt.y);
+  ctx2d.stroke();
+  ctx2d.beginPath();
+  ctx2d.moveTo(pt.x, pt.y);
+  lastPt = pt;
+
+  pushSample(e);
+});
+
+canvas.addEventListener('pointerup',     endStroke);
+canvas.addEventListener('pointercancel', endStroke);
+
+function endStroke(e) {
+  if (!isDrawing) return;
+  isDrawing = false;
+  flushBatch();
+  clearInterval(batchTimer);
+  batchTimer = null;
+  send(encodeStrokeEnd(strokeId));
+  ctx2d.globalCompositeOperation = 'source-over';
+}
+
+function pushSample(e) {
+  const wrap = document.getElementById('canvas-wrap');
+  sampleBuffer.push({
+    x:        e.offsetX / wrap.clientWidth,
+    y:        e.offsetY / wrap.clientHeight,
+    pressure: e.pressure || 0.5,
+    tilt:     e.tiltX    || 0,
+    t_ms:     Date.now() - strokeStartTime,
+  });
+}
+
+function startBatchTimer() {
+  batchTimer = setInterval(flushBatch, BATCH_INTERVAL_MS);
+}
+
+function flushBatch() {
+  if (sampleBuffer.length === 0) return;
+  const batch = sampleBuffer.splice(0);
+  send(encodeStrokeBatch(strokeId, batch));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// UI helpers
+// ─────────────────────────────────────────────────────────────────────────────
+function setMode(m) {
+  mode = m;
+  document.getElementById('btn-draw').classList.toggle('active', m === 'draw');
+  document.getElementById('btn-erase').classList.toggle('active', m === 'erase');
+}
+
+function setColor(el) {
+  document.querySelectorAll('.swatch').forEach(s => s.classList.remove('selected'));
+  el.classList.add('selected');
+  color = el.dataset.color;
+  setMode('draw');
+}
+
+function setStatus(msg) {
+  document.getElementById('status').textContent = msg;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Keepalive ping every 30 s
+// ─────────────────────────────────────────────────────────────────────────────
+setInterval(() => {
+  if (wsReady) send(encodePing());
+}, 30_000);
+
+// Boot
+connect();
+</script>
+</body>
+</html>
