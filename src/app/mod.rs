@@ -4,7 +4,7 @@
 
 use anyhow::Result;
 use eframe::egui;
-use tracing::info;
+use tracing::{info, warn};
 
 // anno, pdf, renderer
 use crate::annotations::AnnotationStore;
@@ -16,11 +16,16 @@ pub struct AppConfig {
     pub enable_tablet: bool,
 }
 
+/// Starts the native egui application with a platform-appropriate renderer.
 pub fn run(config: AppConfig) -> Result<()> {
+    configure_linux_runtime();
+
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Inkstone")
             .with_inner_size([1280.0, 900.0]),
+        hardware_acceleration: preferred_hardware_acceleration(),
+        renderer: preferred_renderer(),
         ..Default::default()
     };
 
@@ -30,6 +35,71 @@ pub fn run(config: AppConfig) -> Result<()> {
         Box::new(move |cc| Ok(Box::new(InkstoneApp::new(cc, config)))),
     )
     .map_err(|e| anyhow::anyhow!("eframe error: {e}"))
+}
+
+#[cfg(target_os = "linux")]
+fn configure_linux_runtime() {
+    if std::env::var_os("DISPLAY").is_some()
+        && std::env::var_os("WAYLAND_DISPLAY").is_some()
+        && std::env::var_os("INKSTONE_ALLOW_WAYLAND").is_none()
+    {
+        info!("forcing X11 on Linux because Wayland/EGL startup is unstable in this build");
+        // SAFETY: this runs on the main thread before eframe creates the event loop
+        // or starts any worker threads, so mutating process environment is sound here.
+        unsafe {
+            std::env::remove_var("WAYLAND_DISPLAY");
+        }
+    }
+
+    if std::env::var_os("LIBGL_ALWAYS_SOFTWARE").is_none()
+        && std::env::var_os("INKSTONE_ALLOW_HARDWARE_GL").is_none()
+    {
+        info!("forcing software OpenGL on Linux to avoid broken Mesa/EGL driver startup");
+        // SAFETY: this runs before renderer initialization and before any threads are spawned.
+        unsafe {
+            std::env::set_var("LIBGL_ALWAYS_SOFTWARE", "1");
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn configure_linux_runtime() {}
+
+fn preferred_renderer() -> eframe::Renderer {
+    if let Ok(value) = std::env::var("INKSTONE_RENDERER") {
+        match value.parse() {
+            Ok(renderer) => {
+                info!("using renderer override from INKSTONE_RENDERER={value}");
+                return renderer;
+            }
+            Err(err) => {
+                warn!("ignoring invalid INKSTONE_RENDERER={value}: {err}");
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        info!("using glow renderer on Linux to avoid unstable wgpu/EGL startup paths");
+        eframe::Renderer::Glow
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        eframe::Renderer::Wgpu
+    }
+}
+
+fn preferred_hardware_acceleration() -> eframe::HardwareAcceleration {
+    #[cfg(target_os = "linux")]
+    {
+        eframe::HardwareAcceleration::Off
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        eframe::HardwareAcceleration::Preferred
+    }
 }
 
 pub struct InkstoneApp {
